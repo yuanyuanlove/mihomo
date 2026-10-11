@@ -14,8 +14,10 @@ import (
 
 	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/common/httputils"
+	"github.com/metacubex/mihomo/log"
 
 	"github.com/metacubex/http"
+	"github.com/metacubex/http/http2"
 	"github.com/metacubex/http/httptrace"
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/http3"
@@ -155,7 +157,7 @@ func (c *PacketUpWriter) Close() error {
 	return nil
 }
 
-func NewTransport(dialRaw DialRawFunc, wrapTLS WrapTLSFunc, dialQUIC DialQUICFunc, alpn []string, keepAlivePeriod time.Duration) http.RoundTripper {
+func NewTransport(dialRaw DialRawFunc, wrapTLS WrapTLSFunc, dialQUIC DialQUICFunc, alpn []string, keepAlivePeriod, pingTimeout time.Duration, diagnostics bool) http.RoundTripper {
 	if len(alpn) == 1 && alpn[0] == "h3" { // `alpn: [h3]` means using h3 mode
 		if keepAlivePeriod == 0 {
 			keepAlivePeriod = QuicgoH3KeepAlivePeriod
@@ -200,6 +202,10 @@ func NewTransport(dialRaw DialRawFunc, wrapTLS WrapTLSFunc, dialQUIC DialQUICFun
 	if keepAlivePeriod < 0 {
 		keepAlivePeriod = 0
 	}
+	var diag *h2Diagnostics
+	if diagnostics {
+		diag = newH2Diagnostics()
+	}
 	// use h2c mode to disallow the net/http fallback to http1.1
 	//
 	// Note that this usage is only applicable to our own net/http fork.
@@ -207,7 +213,7 @@ func NewTransport(dialRaw DialRawFunc, wrapTLS WrapTLSFunc, dialQUIC DialQUICFun
 	// see: https://github.com/golang/go/issues/79293#issuecomment-4426393534
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
-	return &http.Transport{
+	transport := &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			raw, err := dialRaw(ctx)
 			if err != nil {
@@ -218,14 +224,33 @@ func NewTransport(dialRaw DialRawFunc, wrapTLS WrapTLSFunc, dialQUIC DialQUICFun
 				_ = raw.Close()
 				return nil, err
 			}
+			if diag != nil {
+				wrapped = diag.wrapConn(wrapped)
+			}
 			return wrapped, nil
 		},
 		IdleConnTimeout: ConnIdleTimeout,
 		Protocols:       protocols,
 		HTTP2: &http.HTTP2Config{
 			SendPingTimeout: keepAlivePeriod,
+			PingTimeout:     pingTimeout,
+			CountError:      diag.countErrorHook(),
 		},
 	}
+	if diag != nil {
+		// v0.1.8's bundled client reads timeout values from HTTP2Config but
+		// error sites use http2.Transport.CountError directly. Install the public
+		// implementation from the same pinned library only for diagnostics.
+		h2, err := http2.ConfigureTransports(transport)
+		if err != nil {
+			// A fresh Transport has no registered alternate protocol; this failure
+			// is not expected. Report unavailability rather than logging raw errors.
+			log.Warnln("[XHTTP H2] transport=%d event=diagnostic_setup_failed", diag.id)
+		} else {
+			h2.CountError = diag.countErrorHook()
+		}
+	}
+	return transport
 }
 
 type Client struct {

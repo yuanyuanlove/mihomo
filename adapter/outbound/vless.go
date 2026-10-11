@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"strconv"
@@ -125,6 +126,22 @@ type XHTTPReuseSettings struct {
 	HMaxRequestTimes string `proxy:"h-max-request-times,omitempty"`
 	HMaxReusableSecs string `proxy:"h-max-reusable-secs,omitempty"`
 	HKeepAlivePeriod int    `proxy:"h-keep-alive-period,omitempty"`
+	HPingTimeout     int    `proxy:"h-ping-timeout,omitempty"` // seconds; zero keeps the HTTP/2 default
+	H2Diagnostics    bool   `proxy:"h2-diagnostics,omitempty"`
+}
+
+// transportSettings follows the existing reuse-settings replacement semantics:
+// a missing download reuse-settings inherits the upload settings; a present one
+// resolves its omitted values to defaults rather than merging individual fields.
+func (s *XHTTPReuseSettings) transportSettings() (keepAlive, pingTimeout time.Duration, diagnostics bool, err error) {
+	if s == nil {
+		return
+	}
+	if s.HPingTimeout < 0 || int64(s.HPingTimeout) > math.MaxInt64/int64(time.Second) {
+		err = errors.New("invalid h-ping-timeout: must be non-negative seconds representable as time.Duration")
+		return
+	}
+	return time.Duration(s.HKeepAlivePeriod) * time.Second, time.Duration(s.HPingTimeout) * time.Second, s.H2Diagnostics, nil
 }
 
 type XHTTPDownloadSettings struct {
@@ -624,7 +641,10 @@ func NewVless(option VlessOption) (*Vless, error) {
 			}
 		}
 
-		var hKeepAlivePeriod time.Duration
+		hKeepAlivePeriod, hPingTimeout, h2Diagnostics, err := option.XHTTPOpts.ReuseSettings.transportSettings()
+		if err != nil {
+			return nil, err
+		}
 
 		var reuseCfg *xhttp.ReuseConfig
 		if option.XHTTPOpts.ReuseSettings != nil {
@@ -635,7 +655,6 @@ func NewVless(option VlessOption) (*Vless, error) {
 				HMaxRequestTimes: option.XHTTPOpts.ReuseSettings.HMaxRequestTimes,
 				HMaxReusableSecs: option.XHTTPOpts.ReuseSettings.HMaxReusableSecs,
 			}
-			hKeepAlivePeriod = time.Duration(option.XHTTPOpts.ReuseSettings.HKeepAlivePeriod) * time.Second
 		}
 
 		cfg := &xhttp.Config{
@@ -712,7 +731,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 					return quicConn, nil
 				},
 				v.option.ALPN,
-				hKeepAlivePeriod,
+				hKeepAlivePeriod, hPingTimeout, h2Diagnostics,
 			)
 		}
 		var makeDownloadTransport func() http.RoundTripper
@@ -806,7 +825,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 				}
 			}
 
-			downloadHKeepAlivePeriod := hKeepAlivePeriod
+			downloadHKeepAlivePeriod, downloadHPingTimeout, downloadH2Diagnostics := hKeepAlivePeriod, hPingTimeout, h2Diagnostics
 
 			downloadCfg := *cfg // make a copy
 			downloadCfg.Host = downloadHost
@@ -821,7 +840,10 @@ func NewVless(option VlessOption) (*Vless, error) {
 					HMaxRequestTimes: ds.ReuseSettings.HMaxRequestTimes,
 					HMaxReusableSecs: ds.ReuseSettings.HMaxReusableSecs,
 				}
-				downloadHKeepAlivePeriod = time.Duration(ds.ReuseSettings.HKeepAlivePeriod) * time.Second
+				downloadHKeepAlivePeriod, downloadHPingTimeout, downloadH2Diagnostics, err = ds.ReuseSettings.transportSettings()
+				if err != nil {
+					return nil, fmt.Errorf("xhttp download-settings: %w", err)
+				}
 			}
 
 			cfg.DownloadConfig = &downloadCfg
@@ -903,7 +925,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 						return quicConn, nil
 					},
 					downloadALPN,
-					downloadHKeepAlivePeriod,
+					downloadHKeepAlivePeriod, downloadHPingTimeout, downloadH2Diagnostics,
 				)
 			}
 		}
