@@ -5,6 +5,10 @@ This experimental branch intentionally starts from the fixed Go proxy-core commi
 Do not merge `main`, update dependencies, commit, push, open a PR, publish a release,
 install the core, or change any real proxy profile while performing these checks.
 
+The three inherited GitHub Actions workflows are intentionally omitted from this
+cloud-only experiment branch. Checks run in the selected Codex cloud environment;
+there is no inherited release/update pipeline on this branch.
+
 ## Experiment
 
 - Optional XHTTP/H2 `h-ping-timeout`: integer seconds; omitted/0 keeps the 15-second default; positive values override it. Negative/overflowing values are rejected.
